@@ -86,6 +86,37 @@ All resume processing happens locally. The only data that leaves your machine (o
 
 ---
 
+## Local Setup
+
+Requires Python 3.12 or newer.
+
+```bash
+python -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python resumeranker_server.py
+```
+
+Optional AI features use Groq-compatible OpenAI API settings from `.env`:
+
+```bash
+copy .env.example .env
+```
+
+Then fill in `GROQ_API_KEY_1`.
+
+## Quality Checks
+
+```bash
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+```
+
+CI runs the same test suite on Python 3.12 and 3.13.
+
+---
+
 ## What Makes It Different
 
 Most resume screeners do keyword matching — if the JD says "React" and the resume says "React", it's a match. ResumeRanker goes further:
