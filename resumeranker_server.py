@@ -13,7 +13,7 @@ Requires:
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import uvicorn
 import os
@@ -22,6 +22,7 @@ import re
 import json
 import platform
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime
 import time
@@ -63,8 +64,14 @@ REQUIRED_PACKAGES = [
 # ============================================
 
 SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
-# Port can be passed as command-line argument or from env
-SERVER_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("SERVER_PORT", "8892"))
+
+def get_server_port() -> int:
+    """Resolve server port from CLI or environment without breaking module imports."""
+    if len(sys.argv) > 1 and sys.argv[1].isdigit():
+        return int(sys.argv[1])
+    return int(os.getenv("SERVER_PORT", "8892"))
+
+SERVER_PORT = get_server_port()
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY_1", "")
 PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "openai/gpt-oss-20b")
@@ -150,10 +157,10 @@ class LlmDimensionScore(BaseModel):
     reasoning: str = ""
 
 class LlmContextualScores(BaseModel):
-    projects: LlmDimensionScore = LlmDimensionScore()
-    experience: LlmDimensionScore = LlmDimensionScore()
-    certifications: LlmDimensionScore = LlmDimensionScore()
-    skills: LlmDimensionScore = LlmDimensionScore()
+    projects: LlmDimensionScore = Field(default_factory=LlmDimensionScore)
+    experience: LlmDimensionScore = Field(default_factory=LlmDimensionScore)
+    certifications: LlmDimensionScore = Field(default_factory=LlmDimensionScore)
+    skills: LlmDimensionScore = Field(default_factory=LlmDimensionScore)
 
 class RankedCandidate(BaseModel):
     candidate_name: str
@@ -2046,7 +2053,8 @@ def is_safe_path(file_path: str, root_folder: str) -> bool:
     try:
         file_resolved = Path(file_path).resolve()
         root_resolved = Path(root_folder).resolve()
-        return str(file_resolved).startswith(str(root_resolved))
+        file_resolved.relative_to(root_resolved)
+        return True
     except Exception:
         return False
 
@@ -2117,6 +2125,16 @@ async def get_packages():
         "packages": packages,
         "all_installed": all_installed
     }
+
+@app.post("/shutdown")
+async def shutdown():
+    """Gracefully stop the local development server when launched by the UI."""
+    def stop_server():
+        time.sleep(0.2)
+        os._exit(0)
+
+    threading.Thread(target=stop_server, daemon=True).start()
+    return {"success": True}
 
 @app.post("/scan_folder", response_model=ScanFolderResponse)
 async def scan_folder(request: ScanFolderRequest):
@@ -2361,7 +2379,7 @@ async def rank_resumes(request: RankRequest):
         print(f"Stage 1 complete: {len(candidates)} resumes scored", flush=True)
 
         # ---- STAGE 2: Batch LLM Deep Evaluation (always runs if API key available) ----
-        if GROQ_API_KEY:
+        if use_deep_eval and GROQ_API_KEY:
             shortlist_size = min(top_n * 4, len(candidates))
             shortlisted = candidates[:shortlist_size]
             print(f"Stage 2: Batch LLM evaluation on top {shortlist_size} candidates...", flush=True)
@@ -2607,7 +2625,7 @@ async def rank_multi(request: RankMultiRequest):
                 else:
                     batch_role_label = label
 
-            if GROQ_API_KEY:
+            if use_deep_eval and GROQ_API_KEY:
                 shortlist_size = min(top_n * 4, len(candidates))
                 shortlisted = candidates[:shortlist_size]
                 print(f"  Stage 2: Batch LLM evaluation on top {shortlist_size} for '{jd_entry.jd_label}' (role: {batch_role_label})...", flush=True)

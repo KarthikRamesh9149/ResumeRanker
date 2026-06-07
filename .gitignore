@@ -1,5 +1,8 @@
 .env
 __pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
 *.pyc
 .DS_Store
 Thumbs.db
@@ -7,4 +10,5 @@ Thumbs.db
 .idea/
 resumes/
 *.docx
+.venv/
 venv/
