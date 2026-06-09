@@ -2,8 +2,6 @@
 
 # ResumeRanker
 
-![ResumeRanker demo preview](docs/assets/resumeranker-demo-preview.svg)
-
 Local-first resume screening for technical hiring. ResumeRanker reads PDF, DOCX, and TXT resumes from a folder, extracts job requirements from a pasted or uploaded job description, and returns explainable candidate rankings based on demonstrated skills, project relevance, work experience, certifications, and optional LLM review.
 
 The project is designed for high-signal recruiting workflows: run the deterministic scoring locally for every resume, then optionally send only shortlisted candidate summaries to a Groq/OpenAI-compatible model for deeper contextual scoring and recruiter-ready explanations.
