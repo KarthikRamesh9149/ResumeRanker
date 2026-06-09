@@ -2,6 +2,8 @@
 
 # ResumeRanker
 
+![ResumeRanker demo preview](docs/assets/resumeranker-demo-preview.svg)
+
 Local-first resume screening for technical hiring. ResumeRanker reads PDF, DOCX, and TXT resumes from a folder, extracts job requirements from a pasted or uploaded job description, and returns explainable candidate rankings based on demonstrated skills, project relevance, work experience, certifications, and optional LLM review.
 
 The project is designed for high-signal recruiting workflows: run the deterministic scoring locally for every resume, then optionally send only shortlisted candidate summaries to a Groq/OpenAI-compatible model for deeper contextual scoring and recruiter-ready explanations.
@@ -240,3 +242,7 @@ Current test coverage includes:
 - Dependency list is small and focused: FastAPI, Pydantic, scikit-learn, PyMuPDF, python-docx, requests, and pytest/httpx for tests.
 
 ResumeRanker is built to make technical resume review faster, more consistent, and easier to defend in conversation with hiring teams.
+
+## License
+
+All rights reserved. This repository is public for portfolio and recruitment review. Reuse, redistribution, or commercial use requires explicit written permission from Karthik Ramesh.
