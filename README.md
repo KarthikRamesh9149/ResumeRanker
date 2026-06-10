@@ -6,6 +6,12 @@ Local-first resume screening for technical hiring. ResumeRanker reads PDF, DOCX,
 
 The project is designed for high-signal recruiting workflows: run the deterministic scoring locally for every resume, then optionally send only shortlisted candidate summaries to a Groq/OpenAI-compatible model for deeper contextual scoring and recruiter-ready explanations.
 
+## Product Screenshot
+
+Real local FastAPI run showing the standalone backend surface. The richer `ResumeRankerWindow.tsx` screen is designed for the host Electron workflow environment, while `/docs` remains directly runnable from this repository.
+
+![ResumeRanker FastAPI docs with screening and ranking endpoints](docs/assets/screenshots/resumeranker-api-docs.png)
+
 ## Why This Matters
 
 Most resume filters overvalue keyword presence. A resume that lists "React" once in a skills section can look the same as a resume that used React in a production project. ResumeRanker separates those cases by looking at where evidence appears in the resume and by scoring project, experience, skills, and certification sections independently.
