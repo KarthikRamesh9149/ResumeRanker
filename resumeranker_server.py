@@ -81,6 +81,14 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 MAX_SUMMARY_LENGTH = 800
+DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+
+
+def get_cors_origins() -> List[str]:
+    """Resolve explicit browser origins for the local UI without wildcard CORS."""
+    raw = os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return origins or DEFAULT_CORS_ORIGINS.split(",")
 
 # ============================================
 # FastAPI Setup
@@ -90,7 +98,7 @@ app = FastAPI(title="ResumeRanker Server")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
