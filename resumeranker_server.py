@@ -63,7 +63,19 @@ REQUIRED_PACKAGES = [
 # Configuration
 # ============================================
 
-SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
+def get_server_host() -> str:
+    """Keep the API on loopback unless a local operator explicitly opts in."""
+    requested = os.getenv("SERVER_HOST", "127.0.0.1").strip()
+    allow_exposure = os.getenv(
+        "RESUMERANKER_ALLOW_NETWORK_EXPOSURE", "false"
+    ).lower() in {"1", "true", "yes"}
+    if requested in {"localhost", "127.0.0.1", "::1"} or allow_exposure:
+        return requested
+    return "127.0.0.1"
+
+
+SERVER_HOST = get_server_host()
+
 
 def get_server_port() -> int:
     """Resolve server port from CLI or environment without breaking module imports."""
@@ -82,6 +94,96 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 MAX_SUMMARY_LENGTH = 800
 DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+
+
+def bounded_positive_int(name: str, default: int, maximum: int) -> int:
+    """Read a bounded setting without allowing a broken environment to stop startup."""
+    try:
+        return min(maximum, max(1, int(os.getenv(name, str(default)))))
+    except ValueError:
+        return default
+
+
+def env_enabled(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in {"1", "true", "yes"}
+
+
+MAX_SCAN_FILES = bounded_positive_int("RESUMERANKER_MAX_SCAN_FILES", 100, 500)
+MAX_FILE_BYTES = bounded_positive_int(
+    "RESUMERANKER_MAX_FILE_BYTES", 10 * 1024 * 1024, 50 * 1024 * 1024
+)
+MAX_FOLDER_BYTES = bounded_positive_int(
+    "RESUMERANKER_MAX_FOLDER_BYTES", 100 * 1024 * 1024, 500 * 1024 * 1024
+)
+MAX_JD_ENTRIES = bounded_positive_int("RESUMERANKER_MAX_JD_ENTRIES", 5, 20)
+MAX_LLM_CANDIDATES = bounded_positive_int("RESUMERANKER_MAX_LLM_CANDIDATES", 5, 10)
+
+
+def get_approved_root() -> Optional[Path]:
+    """Return the canonical filesystem root or disable file access when unset."""
+    configured_root = os.getenv("RESUMERANKER_APPROVED_ROOT", "").strip()
+    if not configured_root:
+        return None
+    try:
+        root = Path(configured_root).expanduser().resolve(strict=True)
+        return root if root.is_dir() else None
+    except OSError:
+        return None
+
+
+def resolve_approved_path(
+    user_path: str, *, directory: Optional[bool] = None
+) -> Optional[Path]:
+    """Resolve an existing path only when it is within the configured root."""
+    root = get_approved_root()
+    if root is None or not user_path:
+        return None
+    try:
+        candidate = Path(user_path).expanduser().resolve(strict=True)
+        candidate.relative_to(root)
+        if directory is True and not candidate.is_dir():
+            return None
+        if directory is False and not candidate.is_file():
+            return None
+        return candidate
+    except (OSError, ValueError):
+        return None
+
+
+def document_files(folder: Path) -> Optional[List[Path]]:
+    """List only approved regular documents within bounded file and byte limits."""
+    files: List[Path] = []
+    total_bytes = 0
+    try:
+        for item in folder.iterdir():
+            resolved = resolve_approved_path(str(item), directory=False)
+            if resolved is None or resolved.suffix.lower() not in ALLOWED_EXTENSIONS:
+                continue
+            size = resolved.stat().st_size
+            if size > MAX_FILE_BYTES:
+                return None
+            total_bytes += size
+            if total_bytes > MAX_FOLDER_BYTES or len(files) >= MAX_SCAN_FILES:
+                return None
+            files.append(resolved)
+    except OSError:
+        return None
+    return files
+
+
+def approved_document_path(user_path: str) -> Optional[Path]:
+    path = resolve_approved_path(user_path, directory=False)
+    if path is None or path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        return None
+    try:
+        return path if path.stat().st_size <= MAX_FILE_BYTES else None
+    except OSError:
+        return None
+
+
+def llm_calls_allowed(requested: bool) -> bool:
+    """Require explicit local opt-in before sending resume data to a provider."""
+    return requested and env_enabled("RESUMERANKER_ENABLE_LLM_CALLS") and bool(GROQ_API_KEY)
 
 
 def get_cors_origins() -> List[str]:
@@ -125,7 +227,7 @@ class ScanFolderResponse(BaseModel):
 class AnalyzeJdRequest(BaseModel):
     job_description: str = ""
     jd_file_path: str = ""
-    use_llm: bool = True
+    use_llm: bool = False
 
 class ExtractedRequirements(BaseModel):
     required_skills: List[str] = []
@@ -149,7 +251,7 @@ class RankRequest(BaseModel):
     job_description: str = ""  # Text pasted directly
     jd_file_path: str = ""  # Path to uploaded PDF/DOCX file
     use_llm: bool = False
-    use_llm_for_jd: bool = True  # Use LLM to analyze JD
+    use_llm_for_jd: bool = False  # Use LLM to analyze JD
     use_deep_eval: bool = False  # LLM deep evaluation on shortlisted candidates
     top_n: int = 5  # Return top N results (default 5)
     requirements: Optional[ExtractedRequirements] = None
@@ -193,7 +295,7 @@ class RankResponse(BaseModel):
 
 class OpenFileRequest(BaseModel):
     path: str
-    root_folder: str
+    root_folder: Optional[str] = None  # Deprecated: server uses RESUMERANKER_APPROVED_ROOT.
 
 class OpenFileResponse(BaseModel):
     success: bool
@@ -209,7 +311,7 @@ class RankMultiRequest(BaseModel):
     folder_path: str
     jd_entries: List[JdEntryRequest]
     use_llm: bool = False
-    use_llm_for_jd: bool = True
+    use_llm_for_jd: bool = False
     use_deep_eval: bool = False
     top_n: int = 5
 
@@ -850,7 +952,7 @@ def detect_and_extract_roles(jd_text: str, use_llm: bool = True) -> Optional[Lis
         requirements = None
 
         # Try LLM extraction for this section
-        if use_llm and GROQ_API_KEY:
+        if llm_calls_allowed(use_llm):
             requirements = extract_requirements_with_llm(section_text)
 
         # Fallback to rule-based
@@ -1022,7 +1124,7 @@ def analyze_job_description(jd_text: str, use_llm: bool = True) -> ExtractedRequ
     Main function to analyze JD and extract requirements.
     Uses LLM if available and enabled, falls back to rule-based.
     """
-    if use_llm and GROQ_API_KEY:
+    if llm_calls_allowed(use_llm):
         llm_result = extract_requirements_with_llm(jd_text)
         if llm_result and (llm_result.required_skills or llm_result.preferred_skills):
             return llm_result
@@ -2057,14 +2159,8 @@ def open_file_locally(file_path: str) -> bool:
         return False
 
 def is_safe_path(file_path: str, root_folder: str) -> bool:
-    """Check if file_path is safely within root_folder (prevent path traversal)."""
-    try:
-        file_resolved = Path(file_path).resolve()
-        root_resolved = Path(root_folder).resolve()
-        file_resolved.relative_to(root_resolved)
-        return True
-    except Exception:
-        return False
+    """Compatibility helper: supplied roots are not trusted; the configured root is."""
+    return resolve_approved_path(file_path, directory=False) is not None
 
 # ============================================
 # Package Management
@@ -2136,7 +2232,10 @@ async def get_packages():
 
 @app.post("/shutdown")
 async def shutdown():
-    """Gracefully stop the local development server when launched by the UI."""
+    """Stop only when a local operator explicitly enables this legacy endpoint."""
+    if not env_enabled("RESUMERANKER_ENABLE_SHUTDOWN") or SERVER_HOST not in {"localhost", "127.0.0.1", "::1"}:
+        return {"success": False, "error": "This operation is disabled"}
+
     def stop_server():
         time.sleep(0.2)
         os._exit(0)
@@ -2152,25 +2251,24 @@ async def scan_folder(request: ScanFolderRequest):
     if not folder_path:
         return ScanFolderResponse(success=False, error="Folder path is required")
 
-    path = Path(folder_path)
+    path = resolve_approved_path(folder_path, directory=True)
+    if path is None:
+        return ScanFolderResponse(success=False, error="Folder access is not available")
 
-    if not path.exists():
-        return ScanFolderResponse(success=False, error=f"Folder does not exist: {folder_path}")
-
-    if not path.is_dir():
-        return ScanFolderResponse(success=False, error=f"Path is not a directory: {folder_path}")
+    documents = document_files(path)
+    if documents is None:
+        return ScanFolderResponse(success=False, error="Folder exceeds configured file limits")
 
     files = []
     try:
-        for item in path.iterdir():
-            if item.is_file() and item.suffix.lower() in ALLOWED_EXTENSIONS:
-                stat = item.stat()
-                files.append(FileInfo(
-                    name=item.name,
-                    path=str(item.resolve()),
-                    ext=item.suffix.lower(),
-                    modified=datetime.fromtimestamp(stat.st_mtime).isoformat()
-                ))
+        for item in documents:
+            stat = item.stat()
+            files.append(FileInfo(
+                name=item.name,
+                path=str(item),
+                ext=item.suffix.lower(),
+                modified=datetime.fromtimestamp(stat.st_mtime).isoformat()
+            ))
 
         # Sort by modification time (newest first)
         files.sort(key=lambda x: x.modified, reverse=True)
@@ -2181,7 +2279,7 @@ async def scan_folder(request: ScanFolderRequest):
             files=files
         )
     except Exception as e:
-        return ScanFolderResponse(success=False, error=str(e))
+        return ScanFolderResponse(success=False, error="Folder could not be scanned")
 
 @app.post("/analyze_jd", response_model=AnalyzeJdResponse)
 async def analyze_jd(request: AnalyzeJdRequest):
@@ -2196,12 +2294,10 @@ async def analyze_jd(request: AnalyzeJdRequest):
 
     # Extract text from file if path provided
     if jd_file_path and jd_file_path.strip():
-        jd_path = Path(jd_file_path.strip())
-        if not jd_path.exists():
-            return AnalyzeJdResponse(success=False, error=f"File not found: {jd_file_path}")
-        if jd_path.suffix.lower() not in ALLOWED_EXTENSIONS:
-            return AnalyzeJdResponse(success=False, error=f"Unsupported file type: {jd_path.suffix}")
-        jd_text = extract_resume_text(str(jd_path.resolve()))
+        jd_path = approved_document_path(jd_file_path.strip())
+        if jd_path is None:
+            return AnalyzeJdResponse(success=False, error="Job description file is not available")
+        jd_text = extract_resume_text(str(jd_path))
         print(f"Extracted JD from file: {len(jd_text)} chars", flush=True)
 
     if not jd_text or len(jd_text.strip()) < 20:
@@ -2223,7 +2319,7 @@ async def analyze_jd(request: AnalyzeJdRequest):
         return AnalyzeJdResponse(success=True, requirements=requirements)
     except Exception as e:
         print(f"Error analyzing JD: {e}", flush=True)
-        return AnalyzeJdResponse(success=False, error=str(e))
+        return AnalyzeJdResponse(success=False, error="Job description could not be analyzed")
 
 
 @app.post("/rank", response_model=RankResponse)
@@ -2241,12 +2337,10 @@ async def rank_resumes(request: RankRequest):
 
     # If a JD file was uploaded, extract text from it
     if jd_file_path and jd_file_path.strip():
-        jd_path = Path(jd_file_path.strip())
-        if not jd_path.exists():
-            return RankResponse(success=False, error=f"JD file not found: {jd_file_path}")
-        if jd_path.suffix.lower() not in ALLOWED_EXTENSIONS:
-            return RankResponse(success=False, error=f"Unsupported JD file type: {jd_path.suffix}")
-        jd_text = extract_resume_text(str(jd_path.resolve()))
+        jd_path = approved_document_path(jd_file_path.strip())
+        if jd_path is None:
+            return RankResponse(success=False, error="Job description file is not available")
+        jd_text = extract_resume_text(str(jd_path))
         if not jd_text or len(jd_text.strip()) < 20:
             return RankResponse(success=False, error="Could not extract text from JD file")
         print(f"Extracted JD text from file: {len(jd_text)} chars", flush=True)
@@ -2254,10 +2348,12 @@ async def rank_resumes(request: RankRequest):
     if not folder_path or not jd_text or not jd_text.strip():
         return RankResponse(success=False, error="Folder path and job description are required")
 
-    path = Path(folder_path)
-
-    if not path.exists() or not path.is_dir():
-        return RankResponse(success=False, error=f"Invalid folder: {folder_path}")
+    path = resolve_approved_path(folder_path, directory=True)
+    if path is None:
+        return RankResponse(success=False, error="Folder access is not available")
+    documents = document_files(path)
+    if documents is None:
+        return RankResponse(success=False, error="Folder exceeds configured file limits")
 
     # Use provided requirements or analyze JD
     if request.requirements:
@@ -2281,11 +2377,8 @@ async def rank_resumes(request: RankRequest):
         # ---- STAGE 1: Section-based scoring (FREE, runs on ALL resumes) ----
         print(f"Stage 1: Scoring all resumes with section-based analysis...", flush=True)
 
-        for item in path.iterdir():
-            if not item.is_file() or item.suffix.lower() not in ALLOWED_EXTENSIONS:
-                continue
-
-            file_path = str(item.resolve())
+        for item in documents:
+            file_path = str(item)
 
             # Extract resume text
             resume_text = extract_resume_text(file_path)
@@ -2387,8 +2480,8 @@ async def rank_resumes(request: RankRequest):
         print(f"Stage 1 complete: {len(candidates)} resumes scored", flush=True)
 
         # ---- STAGE 2: Batch LLM Deep Evaluation (always runs if API key available) ----
-        if use_deep_eval and GROQ_API_KEY:
-            shortlist_size = min(top_n * 4, len(candidates))
+        if llm_calls_allowed(use_deep_eval):
+            shortlist_size = min(top_n * 4, MAX_LLM_CANDIDATES, len(candidates))
             shortlisted = candidates[:shortlist_size]
             print(f"Stage 2: Batch LLM evaluation on top {shortlist_size} candidates...", flush=True)
 
@@ -2426,8 +2519,8 @@ async def rank_resumes(request: RankRequest):
             print(f"Stage 2 complete: {eval_success}/{shortlist_size} evaluated, top {len(top_candidates)} re-ranked", flush=True)
 
             # Generate LLM explanations for the final top candidates
-            if use_llm:
-                for i, entry in enumerate(shortlisted[:top_n]):
+            if llm_calls_allowed(use_llm):
+                for i, entry in enumerate(shortlisted[:min(top_n, MAX_LLM_CANDIDATES)]):
                     cand = entry["candidate"]
                     resume_text_for_llm = entry.get("resume_text", "")
                     all_matched = cand.matched_required + cand.matched_preferred
@@ -2452,7 +2545,7 @@ async def rank_resumes(request: RankRequest):
 
     except Exception as e:
         print(f"Error ranking resumes: {e}", flush=True)
-        return RankResponse(success=False, error=str(e))
+        return RankResponse(success=False, error="Ranking could not be completed")
 
 
 @app.post("/rank_multi", response_model=RankMultiResponse)
@@ -2474,20 +2567,23 @@ async def rank_multi(request: RankMultiRequest):
 
     if not jd_entries:
         return RankMultiResponse(success=False, error="At least one JD is required")
+    if len(jd_entries) > MAX_JD_ENTRIES:
+        return RankMultiResponse(success=False, error="Too many job descriptions")
 
-    path = Path(folder_path)
-    if not path.exists() or not path.is_dir():
-        return RankMultiResponse(success=False, error=f"Invalid folder: {folder_path}")
+    path = resolve_approved_path(folder_path, directory=True)
+    if path is None:
+        return RankMultiResponse(success=False, error="Folder access is not available")
+    documents = document_files(path)
+    if documents is None:
+        return RankMultiResponse(success=False, error="Folder exceeds configured file limits")
 
     try:
         # ---- Read ALL resumes ONCE ----
         print(f"Reading resumes from {folder_path}...", flush=True)
         resume_cache = []  # list of (file_path, file_name, resume_text, candidate_name, sections)
 
-        for item in path.iterdir():
-            if not item.is_file() or item.suffix.lower() not in ALLOWED_EXTENSIONS:
-                continue
-            file_path = str(item.resolve())
+        for item in documents:
+            file_path = str(item)
             resume_text = extract_resume_text(file_path)
             if not resume_text or len(resume_text.strip()) < 50:
                 continue
@@ -2512,9 +2608,15 @@ async def rank_multi(request: RankMultiRequest):
 
             # Extract text from JD file if needed
             if jd_file_path and jd_file_path.strip():
-                jd_path = Path(jd_file_path.strip())
-                if jd_path.exists() and jd_path.suffix.lower() in ALLOWED_EXTENSIONS:
-                    jd_text = extract_resume_text(str(jd_path.resolve()))
+                jd_path = approved_document_path(jd_file_path.strip())
+                if jd_path is None:
+                    jd_results.append(JdRankResult(
+                        jd_label=jd_entry.jd_label or "Unknown JD",
+                        candidates=[],
+                        requirements_used=ExtractedRequirements()
+                    ))
+                    continue
+                jd_text = extract_resume_text(str(jd_path))
 
             if not jd_text or len(jd_text.strip()) < 20:
                 jd_results.append(JdRankResult(
@@ -2633,8 +2735,8 @@ async def rank_multi(request: RankMultiRequest):
                 else:
                     batch_role_label = label
 
-            if use_deep_eval and GROQ_API_KEY:
-                shortlist_size = min(top_n * 4, len(candidates))
+            if llm_calls_allowed(use_deep_eval):
+                shortlist_size = min(top_n * 4, MAX_LLM_CANDIDATES, len(candidates))
                 shortlisted = candidates[:shortlist_size]
                 print(f"  Stage 2: Batch LLM evaluation on top {shortlist_size} for '{jd_entry.jd_label}' (role: {batch_role_label})...", flush=True)
 
@@ -2683,8 +2785,8 @@ async def rank_multi(request: RankMultiRequest):
                 else:
                     role_label = label
 
-            if use_llm and GROQ_API_KEY:
-                for i, entry in enumerate(candidates[:top_n]):
+            if llm_calls_allowed(use_llm):
+                for i, entry in enumerate(candidates[:min(top_n, MAX_LLM_CANDIDATES)]):
                     cand = entry["candidate"]
                     resume_text_for_llm = entry.get("resume_text", "")
                     all_matched = cand.matched_required + cand.matched_preferred
@@ -2709,33 +2811,19 @@ async def rank_multi(request: RankMultiRequest):
 
     except Exception as e:
         print(f"Error in rank_multi: {e}", flush=True)
-        return RankMultiResponse(success=False, error=str(e))
+        return RankMultiResponse(success=False, error="Ranking could not be completed")
 
 
 @app.post("/open_file", response_model=OpenFileResponse)
 async def open_file(request: OpenFileRequest):
     """Open a file with the system's default application."""
     file_path = request.path
-    root_folder = request.root_folder
-
-    if not file_path or not root_folder:
-        return OpenFileResponse(success=False, error="Path and root_folder are required")
-
-    # Security check: ensure file is within root folder
-    if not is_safe_path(file_path, root_folder):
-        return OpenFileResponse(success=False, error="Access denied: file is outside the allowed folder")
-
-    # Check file exists
-    path = Path(file_path)
-    if not path.exists():
-        return OpenFileResponse(success=False, error="File does not exist")
-
-    # Check extension is allowed
-    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
-        return OpenFileResponse(success=False, error=f"File type not allowed: {path.suffix}")
+    path = approved_document_path(file_path)
+    if path is None:
+        return OpenFileResponse(success=False, error="File access is not available")
 
     # Open the file
-    if open_file_locally(file_path):
+    if open_file_locally(str(path)):
         return OpenFileResponse(success=True)
     else:
         return OpenFileResponse(success=False, error="Failed to open file")
@@ -2748,21 +2836,17 @@ async def extract_text(request: ExtractTextRequest):
     if not file_path:
         return ExtractTextResponse(success=False, error="File path is required")
 
-    path = Path(file_path)
-
-    if not path.exists():
-        return ExtractTextResponse(success=False, error="File does not exist")
-
-    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
-        return ExtractTextResponse(success=False, error=f"File type not supported: {path.suffix}. Use PDF, DOCX, or TXT.")
+    path = approved_document_path(file_path)
+    if path is None:
+        return ExtractTextResponse(success=False, error="File access is not available")
 
     try:
-        text = extract_resume_text(str(path.resolve()))
+        text = extract_resume_text(str(path))
         if not text or len(text.strip()) < 10:
             return ExtractTextResponse(success=False, error="Could not extract text from file (empty or unreadable)")
         return ExtractTextResponse(success=True, text=clean_text_preserve_lines(text))
-    except Exception as e:
-        return ExtractTextResponse(success=False, error=f"Error extracting text: {str(e)}")
+    except Exception:
+        return ExtractTextResponse(success=False, error="Text could not be extracted")
 
 # ============================================
 # Main

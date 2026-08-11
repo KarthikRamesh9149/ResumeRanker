@@ -136,8 +136,25 @@ Copy-Item .env.example .env
 | `LLM_CALL_DELAY_SECONDS` | `8` in code | Delay between LLM calls to reduce rate-limit failures. |
 | `SERVER_HOST` | `127.0.0.1` | Host for the local FastAPI server. |
 | `SERVER_PORT` | `8892` | Port for the local FastAPI server. |
+| `RESUMERANKER_ALLOW_NETWORK_EXPOSURE` | `false` | Required before a non-loopback `SERVER_HOST` is honored. |
+| `RESUMERANKER_APPROVED_ROOT` | Empty (filesystem features disabled) | Canonical folder containing the resumes and any JD files. |
+| `RESUMERANKER_MAX_SCAN_FILES` | `100` | Maximum supported files scanned per folder. |
+| `RESUMERANKER_MAX_FILE_BYTES` | `10485760` | Maximum size of one resume or JD file. |
+| `RESUMERANKER_MAX_FOLDER_BYTES` | `104857600` | Maximum combined size of scanned resume files. |
+| `RESUMERANKER_ENABLE_LLM_CALLS` | `false` | Explicit opt-in before any resume/JD content is sent to the configured provider. |
+| `RESUMERANKER_MAX_LLM_CANDIDATES` | `5` | Caps candidates sent to optional LLM scoring or explanations. |
+| `RESUMERANKER_ENABLE_SHUTDOWN` | `false` | Enables the legacy shutdown endpoint only for a loopback server. |
 
 Note: `resumeranker_server.py` also has built-in model defaults. Values in `.env` or the shell environment take precedence.
+
+The API remains loopback-only even if `SERVER_HOST` is set to a network address,
+unless `RESUMERANKER_ALLOW_NETWORK_EXPOSURE=true` is explicitly configured.
+
+Set `RESUMERANKER_APPROVED_ROOT` to a dedicated local workspace before using
+folder, file-opening, or JD-file endpoints. All supplied paths are resolved
+against that one canonical root; paths outside it, including symlink escapes,
+are rejected without exposing local path details. Keep this folder limited to
+the resumes and job descriptions needed for the current review.
 
 ### Run
 

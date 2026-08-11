@@ -2,27 +2,51 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from resumeranker_server import DEFAULT_CORS_ORIGINS, LlmContextualScores, app, get_cors_origins, is_safe_path
+from resumeranker_server import (
+    DEFAULT_CORS_ORIGINS,
+    LlmContextualScores,
+    app,
+    get_cors_origins,
+    get_server_host,
+    is_safe_path,
+)
 
 
-def test_is_safe_path_allows_child_path(tmp_path: Path) -> None:
+def test_is_safe_path_allows_child_path(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "resumes"
     root.mkdir()
     resume = root / "candidate.txt"
     resume.write_text("sample", encoding="utf-8")
+    monkeypatch.setenv("RESUMERANKER_APPROVED_ROOT", str(root))
 
     assert is_safe_path(str(resume), str(root)) is True
 
 
-def test_is_safe_path_rejects_sibling_with_matching_prefix(tmp_path: Path) -> None:
+def test_is_safe_path_rejects_sibling_with_matching_prefix(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "resumes"
     sibling = tmp_path / "resumes_backup"
     root.mkdir()
     sibling.mkdir()
     outside = sibling / "candidate.txt"
     outside.write_text("sample", encoding="utf-8")
+    monkeypatch.setenv("RESUMERANKER_APPROVED_ROOT", str(root))
 
     assert is_safe_path(str(outside), str(root)) is False
+
+
+def test_filesystem_access_is_disabled_without_approved_root(tmp_path: Path, monkeypatch) -> None:
+    resume = tmp_path / "candidate.txt"
+    resume.write_text("sample", encoding="utf-8")
+    monkeypatch.delenv("RESUMERANKER_APPROVED_ROOT", raising=False)
+
+    assert is_safe_path(str(resume), str(tmp_path)) is False
+
+
+def test_server_host_stays_loopback_without_explicit_exposure(monkeypatch) -> None:
+    monkeypatch.setenv("SERVER_HOST", "0.0.0.0")
+    monkeypatch.delenv("RESUMERANKER_ALLOW_NETWORK_EXPOSURE", raising=False)
+
+    assert get_server_host() == "127.0.0.1"
 
 
 def test_contextual_score_defaults_are_independent() -> None:
