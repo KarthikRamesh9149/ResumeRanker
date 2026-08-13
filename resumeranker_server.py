@@ -13,10 +13,13 @@ Requires:
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import uvicorn
 import os
+import hmac
 import sys
 import re
 import json
@@ -117,6 +120,9 @@ MAX_FOLDER_BYTES = bounded_positive_int(
 )
 MAX_JD_ENTRIES = bounded_positive_int("RESUMERANKER_MAX_JD_ENTRIES", 5, 20)
 MAX_LLM_CANDIDATES = bounded_positive_int("RESUMERANKER_MAX_LLM_CANDIDATES", 5, 10)
+DEPLOYMENT_MODE = os.getenv("RESUMERANKER_MODE", "production").strip().lower()
+API_TOKEN = os.getenv("RESUMERANKER_API_TOKEN", "")
+MAX_REQUEST_BYTES = bounded_positive_int("RESUMERANKER_MAX_REQUEST_BYTES", 1024 * 1024, 10 * 1024 * 1024)
 
 
 def get_approved_root() -> Optional[Path]:
@@ -192,17 +198,88 @@ def get_cors_origins() -> List[str]:
     origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
     return origins or DEFAULT_CORS_ORIGINS.split(",")
 
+
+def get_trusted_hosts() -> List[str]:
+    raw = os.getenv("TRUSTED_HOSTS", "localhost,127.0.0.1,::1")
+    return [host.strip() for host in raw.split(",") if host.strip()]
+
+
+def demo_mode_enabled() -> bool:
+    return DEPLOYMENT_MODE == "demo" and SERVER_HOST in {"localhost", "127.0.0.1", "::1"}
+
+
+def deployment_configuration_error() -> Optional[str]:
+    if DEPLOYMENT_MODE not in {"production", "demo"}:
+        return "invalid deployment mode"
+    if DEPLOYMENT_MODE == "demo" and not demo_mode_enabled():
+        return "demo mode requires loopback"
+    if DEPLOYMENT_MODE == "production" and len(API_TOKEN) < 32:
+        return "production token missing"
+    if "*" in get_cors_origins() or "*" in get_trusted_hosts():
+        return "wildcards are forbidden"
+    return None
+
+
+class SecurityBoundaryMiddleware:
+    """Bound bodies and authenticate every route except health."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        try:
+            if int(headers.get(b"content-length", b"0")) > MAX_REQUEST_BYTES:
+                await JSONResponse({"detail": "Request too large"}, status_code=413)(scope, receive, send)
+                return
+        except ValueError:
+            await JSONResponse({"detail": "Invalid request"}, status_code=400)(scope, receive, send)
+            return
+        if deployment_configuration_error() and path != "/status":
+            await JSONResponse({"detail": "Service unavailable"}, status_code=503)(scope, receive, send)
+            return
+        if path != "/status" and scope.get("method") != "OPTIONS" and not demo_mode_enabled():
+            authorization = headers.get(b"authorization", b"").decode("latin-1")
+            supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+            if not supplied or not hmac.compare_digest(supplied, API_TOKEN):
+                await JSONResponse({"detail": "Unauthorized"}, status_code=401)(scope, receive, send)
+                return
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                break
+            body.extend(message.get("body", b""))
+            if len(body) > MAX_REQUEST_BYTES:
+                await JSONResponse({"detail": "Request too large"}, status_code=413)(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        delivered = False
+        async def replay_receive():
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+        await self.app(scope, replay_receive, send)
+
 # ============================================
 # FastAPI Setup
 # ============================================
 
 app = FastAPI(title="ResumeRanker Server")
+app.add_middleware(SecurityBoundaryMiddleware)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_trusted_hosts())
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_cors_origins(),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # ============================================
@@ -2211,12 +2288,10 @@ async def status():
     packages = check_packages()
     all_installed = all(p["installed"] for p in packages)
     return {
-        "ready": True,
+        "ready": deployment_configuration_error() is None and all_installed,
         "error": None,
         "server_name": "resumeranker",
-        "port": SERVER_PORT,
-        "llm_enabled": bool(GROQ_API_KEY),
-        "packages_ok": all_installed
+        "mode": DEPLOYMENT_MODE
     }
 
 @app.get("/packages")
@@ -2233,7 +2308,7 @@ async def get_packages():
 @app.post("/shutdown")
 async def shutdown():
     """Stop only when a local operator explicitly enables this legacy endpoint."""
-    if not env_enabled("RESUMERANKER_ENABLE_SHUTDOWN") or SERVER_HOST not in {"localhost", "127.0.0.1", "::1"}:
+    if not demo_mode_enabled() or not env_enabled("RESUMERANKER_ENABLE_SHUTDOWN"):
         return {"success": False, "error": "This operation is disabled"}
 
     def stop_server():

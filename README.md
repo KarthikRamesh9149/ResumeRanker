@@ -1,269 +1,117 @@
-<!-- markdownlint-disable MD013 -->
-
 # ResumeRanker
 
-Local-first resume screening for technical hiring. ResumeRanker reads PDF, DOCX, and TXT resumes from a folder, extracts job requirements from a pasted or uploaded job description, and returns explainable candidate rankings based on demonstrated skills, project relevance, work experience, certifications, and optional LLM review.
+ResumeRanker is an explainable, local-first screening service for PDF, DOCX, and TXT resumes. It extracts job requirements, scores evidence by resume section, supports multi-role job descriptions, and can optionally evaluate a bounded shortlist through a Groq-compatible model.
 
-The project is designed for high-signal recruiting workflows: run the deterministic scoring locally for every resume, then optionally send only shortlisted candidate summaries to a Groq/OpenAI-compatible model for deeper contextual scoring and recruiter-ready explanations.
+![ResumeRanker FastAPI documentation showing the standalone backend routes](docs/assets/screenshots/resumeranker-api-docs.png)
 
-## Product Screenshot
-
-Real local FastAPI run showing the standalone backend surface. The richer `ResumeRankerWindow.tsx` screen is designed for the host Electron workflow environment, while `/docs` remains directly runnable from this repository.
-
-![ResumeRanker FastAPI docs with screening and ranking endpoints](docs/assets/screenshots/resumeranker-api-docs.png)
-
-## Why This Matters
-
-Most resume filters overvalue keyword presence. A resume that lists "React" once in a skills section can look the same as a resume that used React in a production project. ResumeRanker separates those cases by looking at where evidence appears in the resume and by scoring project, experience, skills, and certification sections independently.
-
-That makes the output more useful for hiring teams:
-
-- Shortlists are explainable, not opaque.
-- Strong project portfolios are not automatically buried when formal work experience is thin.
-- Multi-role job descriptions can be split into role-specific requirements before ranking.
-- Resume files stay on the local machine unless optional LLM features are enabled.
-
-## What It Does
-
-- Scans a local folder for supported resume files: `.pdf`, `.docx`, and `.txt`.
-- Extracts text from resumes and job descriptions with PyMuPDF, python-docx, and plain text readers.
-- Detects candidate names and common resume sections such as projects, experience, skills, education, and certifications.
-- Extracts required skills, preferred skills, experience requirements, and certifications from job descriptions.
-- Detects multi-role job descriptions with repeated role sections and ranks candidates separately for each role.
-- Scores candidates with deterministic, section-aware logic before any LLM is used.
-- Optionally uses a Groq/OpenAI-compatible chat completions endpoint for JD analysis, contextual re-ranking, and short explanations.
-- Returns matched and missing required/preferred skills, section scores, similarity values, keyword coverage, and interview focus notes.
-- Includes a dynamic `ResumeRankerWindow.tsx` UI intended for the host Electron workflow environment, plus a standalone FastAPI backend.
+_The standalone FastAPI surface running locally; the richer TypeScript screen is intended for its host workflow._
 
 ## Architecture
 
 ```text
-Resume folder / JD file / pasted JD
-            |
-            v
-   FastAPI backend: resumeranker_server.py
-            |
-            +--> Text extraction: PDF, DOCX, TXT
-            +--> JD requirement extraction: rule-based, optional LLM
-            +--> Resume section parsing: projects, experience, skills, certs
-            +--> Stage 1 local scoring: deterministic scoring for all resumes
-            +--> Stage 2 optional LLM scoring: shortlisted summaries only
-            |
-            v
-   Ranked candidates with explanations and match/gap details
+Host UI or API client
+        |
+Host/CORS allowlists -> body limit -> bearer authentication
+        |
+        v
+approved filesystem root -> bounded document parsing -> deterministic scoring
+                                                    |
+                                                    +-> opt-in LLM shortlist
+        |
+        v
+ranked candidates, matched/missing skills, section scores, explanations
 ```
 
-### Scoring Model
+`resumeranker_server.py` contains the FastAPI boundary, parsers, requirement extraction, ranking, and provider integration. `ResumeRankerWindow.tsx` is a host-workflow UI component, not a standalone packaged frontend.
 
-The deterministic ranking path is the default quality signal and works without network access.
+## Ranking model
 
-| Dimension | What it measures | Implementation notes |
-| --- | --- | --- |
-| Projects | Domain relevance, required/preferred skill use, complexity signals | Combines domain clusters, skill matches, and project complexity indicators. |
-| Experience | Role relevance and relevant technology usage | Gives stronger weight to software engineering indicators than non-development roles. |
-| Skills | Whether required/preferred skills are demonstrated or only listed | Skills found in projects score higher than skills found only in a skills list. |
-| Certifications | Certification overlap with the JD | Used when certifications are present in the extracted JD requirements. |
+Every document is scored locally first. TF-IDF similarity is combined with required/preferred skill coverage and separate project, experience, skills, and certification evidence. Demonstrated project use is weighted more strongly than a keyword listed only in a skills section. If the JD does not request certifications or the resume lacks relevant experience, weights are redistributed rather than silently penalising the candidate. Outputs are decision support, not an automated hiring decision.
 
-Base weighting favors projects and demonstrated skills. When a JD does not request certifications, certification weight is redistributed. When no relevant experience section is found, experience weight shifts toward projects and skills so early-career candidates with strong portfolios are treated more fairly.
+## Secure deployment modes
 
-## API Surface
+Production is the default. Every endpoint except `GET /status`, including `/docs`, `/packages`, local file operations, and shutdown, requires a bearer token. `RESUMERANKER_API_TOKEN` must be at least 32 characters or protected routes return generic `503` responses. Token checks are constant-time. Browser origins and Host headers are explicit allowlists; wildcards fail readiness. JSON request bodies, scanned files, aggregate folder bytes, scan counts, JD entries, and LLM candidates are bounded.
 
-The backend runs as a local FastAPI service.
+`RESUMERANKER_MODE=demo` is the only unauthenticated mode. It works only with a loopback listener and fails closed on a network address. Filesystem features remain disabled until an approved root is configured, and provider calls remain disabled until separately opted in.
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `GET` | `/status` | Health check, configured port, package readiness, and LLM availability. |
-| `GET` | `/packages` | Reports installed status for required Python packages. |
-| `POST` | `/scan_folder` | Lists supported resume files in a local folder. |
-| `POST` | `/analyze_jd` | Extracts requirements from pasted JD text or a JD file path. |
-| `POST` | `/rank` | Ranks resumes against one job description. |
-| `POST` | `/rank_multi` | Ranks the same resume set against multiple job descriptions. |
-| `POST` | `/open_file` | Opens a resume locally after validating it is inside the selected root folder. |
-| `POST` | `/extract_text` | Extracts readable text from a PDF, DOCX, or TXT file. |
-| `POST` | `/shutdown` | Stops the local development server when launched by the UI workflow. |
+## Setup
 
-`top_n` is capped at 20 by the backend. LLM deep evaluation shortlists up to `top_n * 4` candidates and evaluates summaries in batches of three.
+Requires Python 3.12 or 3.13.
 
-## Project Structure
-
-```text
-.
-|-- .github/workflows/ci.yml        # Python CI for 3.12 and 3.13
-|-- .env.example                    # Local server and optional LLM configuration
-|-- README.md                       # Project documentation
-|-- requirements.txt                # Runtime Python dependencies
-|-- requirements-dev.txt            # Test dependencies
-|-- resumeranker_server.py          # FastAPI API, parsing, scoring, and LLM integration
-|-- ResumeRankerWindow.tsx          # Host-app dynamic UI window
-|-- ResumeRankerWindow.meta.json    # UI metadata
-`-- tests/test_resumeranker_server.py
-```
-
-## Local Setup
-
-### Requirements
-
-- Python 3.12 or newer
-- A terminal with access to the resume/JD folders you want to rank
-- Optional: a Groq-compatible API key for LLM-assisted extraction and explanations
-
-### Install
-
-```powershell
-cd C:\Users\rames\OneDrive\Documents\improves\github-upgrades\ResumeRanker
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-### Configure
-
-The deterministic ranking path works without an API key. To enable LLM features, copy the example environment file and fill in the values you want to use:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `GROQ_API_KEY_1` | Empty | Enables optional LLM calls when set. |
-| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | OpenAI-compatible chat completions base URL. |
-| `PRIMARY_MODEL` | `moonshotai/kimi-k2-instruct` in `.env.example` | Primary model for JD extraction, scoring, and explanations. |
-| `FALLBACK_MODEL_1` | `llama-3.3-70b-versatile` in `.env.example` | Fallback model when the primary call fails or returns unusable output. |
-| `LLM_TIMEOUT_SECONDS` | `30` | HTTP timeout for LLM calls. |
-| `MAX_RETRIES` | `1` | Enables fallback explanation attempts. |
-| `LLM_CALL_DELAY_SECONDS` | `8` in code | Delay between LLM calls to reduce rate-limit failures. |
-| `SERVER_HOST` | `127.0.0.1` | Host for the local FastAPI server. |
-| `SERVER_PORT` | `8892` | Port for the local FastAPI server. |
-| `RESUMERANKER_ALLOW_NETWORK_EXPOSURE` | `false` | Required before a non-loopback `SERVER_HOST` is honored. |
-| `RESUMERANKER_APPROVED_ROOT` | Empty (filesystem features disabled) | Canonical folder containing the resumes and any JD files. |
-| `RESUMERANKER_MAX_SCAN_FILES` | `100` | Maximum supported files scanned per folder. |
-| `RESUMERANKER_MAX_FILE_BYTES` | `10485760` | Maximum size of one resume or JD file. |
-| `RESUMERANKER_MAX_FOLDER_BYTES` | `104857600` | Maximum combined size of scanned resume files. |
-| `RESUMERANKER_ENABLE_LLM_CALLS` | `false` | Explicit opt-in before any resume/JD content is sent to the configured provider. |
-| `RESUMERANKER_MAX_LLM_CANDIDATES` | `5` | Caps candidates sent to optional LLM scoring or explanations. |
-| `RESUMERANKER_ENABLE_SHUTDOWN` | `false` | Enables the legacy shutdown endpoint only for a loopback server. |
-
-Note: `resumeranker_server.py` also has built-in model defaults. Values in `.env` or the shell environment take precedence.
-
-The API remains loopback-only even if `SERVER_HOST` is set to a network address,
-unless `RESUMERANKER_ALLOW_NETWORK_EXPOSURE=true` is explicitly configured.
-
-Set `RESUMERANKER_APPROVED_ROOT` to a dedicated local workspace before using
-folder, file-opening, or JD-file endpoints. All supplied paths are resolved
-against that one canonical root; paths outside it, including symlink escapes,
-are rejected without exposing local path details. Keep this folder limited to
-the resumes and job descriptions needed for the current review.
-
-### Run
-
-```powershell
-python resumeranker_server.py
-```
-
-You can override the port with a positional argument:
-
-```powershell
-python resumeranker_server.py 8893
-```
-
-Check the server:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8892/status
-```
-
-## Example API Usage
-
-Rank a folder of resumes against a pasted job description:
-
-```powershell
-$body = @{
-  folder_path = "C:\path\to\resumes"
-  job_description = "We need a backend engineer with Python, FastAPI, PostgreSQL, testing, and API design experience."
-  use_llm = $false
-  use_llm_for_jd = $false
-  use_deep_eval = $false
-  top_n = 5
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8892/rank `
-  -ContentType "application/json" `
-  -Body $body
-```
-
-For multi-role workflows, call `/analyze_jd` first to detect role sections, then submit the resulting entries to `/rank_multi`.
-
-## Scripts And Commands
-
-| Command | Purpose |
-| --- | --- |
-| `python resumeranker_server.py` | Starts the local FastAPI server on `SERVER_PORT` or `8892`. |
-| `python resumeranker_server.py 8893` | Starts the server on a specific port. |
-| `python -m pytest -q` | Runs the test suite. |
-| `python -m pip install -r requirements.txt -r requirements-dev.txt` | Installs runtime and test dependencies. |
-
-## Testing And CI
-
-Install development dependencies, then run:
-
-```powershell
+source .venv/bin/activate
 python -m pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env
+```
+
+Create a dedicated resume workspace and set its canonical path:
+
+```bash
+export RESUMERANKER_APPROVED_ROOT=/absolute/path/to/review-workspace
+```
+
+Explicit local demo:
+
+```bash
+RESUMERANKER_MODE=demo python resumeranker_server.py
+```
+
+Production-style local run:
+
+```bash
+export RESUMERANKER_API_TOKEN='replace-with-a-random-32-plus-character-secret'
+python resumeranker_server.py
+curl -H "Authorization: Bearer $RESUMERANKER_API_TOKEN" http://127.0.0.1:8892/packages
+```
+
+## API
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/status` | Public liveness/readiness without secret or package details |
+| `GET` | `/packages` | Authenticated dependency inventory |
+| `POST` | `/scan_folder` | List supported files under the approved root |
+| `POST` | `/analyze_jd` | Extract requirements and role sections |
+| `POST` | `/rank` | Rank one resume folder against one JD |
+| `POST` | `/rank_multi` | Rank against a bounded JD list |
+| `POST` | `/extract_text` | Extract text from an approved document |
+| `POST` | `/open_file` | Open an approved local document |
+| `POST` | `/shutdown` | Demo-only, loopback-only, explicitly enabled legacy control |
+
+`top_n` is capped at 20. Paths are canonicalised and must remain inside `RESUMERANKER_APPROVED_ROOT`; symlink and sibling-prefix escapes are rejected.
+
+## Configuration and limits
+
+| Variable | Default | Boundary |
+| --- | --- | --- |
+| `RESUMERANKER_MODE` | `production` | `production` or explicit loopback `demo` |
+| `RESUMERANKER_API_TOKEN` | empty | Required in production; minimum 32 characters |
+| `SERVER_HOST` / `SERVER_PORT` | `127.0.0.1` / `8892` | Network binding also requires explicit exposure opt-in |
+| `TRUSTED_HOSTS` | loopback hosts | Host-header allowlist; wildcard forbidden |
+| `CORS_ORIGINS` | local port 3000 origins | Browser allowlist; wildcard forbidden |
+| `RESUMERANKER_MAX_REQUEST_BYTES` | 1 MiB | JSON/body bound; hard maximum 10 MiB |
+| `RESUMERANKER_MAX_SCAN_FILES` | 100 | Hard maximum 500 |
+| `RESUMERANKER_MAX_FILE_BYTES` | 10 MiB | Hard maximum 50 MiB per document |
+| `RESUMERANKER_MAX_FOLDER_BYTES` | 100 MiB | Hard maximum 500 MiB per scan |
+| `RESUMERANKER_MAX_JD_ENTRIES` | 5 | Hard maximum 20 |
+| `RESUMERANKER_MAX_LLM_CANDIDATES` | 5 | Hard maximum 10 |
+
+Provider use requires all three: a request option such as `use_llm`, `RESUMERANKER_ENABLE_LLM_CALLS=true`, and `GROQ_API_KEY_1`. Candidate content may leave the machine when enabled; confirm consent, retention, and data-processing terms first.
+
+## Testing and operations
+
+```bash
+python -m py_compile resumeranker_server.py
 python -m pytest -q
 ```
 
-The GitHub Actions workflow runs the same pytest command on Python 3.12 and 3.13 for pushes to `main`/`master` and for pull requests.
+CI runs the suite on Python 3.12 and 3.13. A deployment gate should require `/status` to report `ready: true`. Put network deployments behind TLS, rate limiting, and an identity-aware proxy; provide secrets through the platform secret manager; run with least-privilege read access to a dedicated approved root; stop production using the process supervisor's graceful signal. The shutdown route is intentionally unavailable in production.
 
-Current test coverage includes:
+## Threat model and limitations
 
-- Safe local path validation for file-opening requests.
-- Independent Pydantic defaults for nested LLM score models.
-- Basic `/status` endpoint readiness.
-
-## Security And Privacy
-
-- By default, the server binds to `127.0.0.1`, keeping the API local to the machine.
-- Resume scanning and deterministic scoring run locally.
-- The optional LLM path sends job description excerpts, extracted requirements, candidate names, and compact resume summaries to the configured OpenAI-compatible API endpoint. Do not enable LLM features for confidential data unless that data handling is acceptable for your environment.
-- `/open_file` validates that the requested file is inside the selected root folder and only opens supported resume/JD file types.
-- `.env` should contain local secrets only and must not be committed.
-- CORS is currently configured with `allow_origins=["*"]` to support the local workflow UI. Tighten this before exposing the server beyond local development.
-
-## Troubleshooting
-
-| Symptom | What to check |
-| --- | --- |
-| `/status` is unreachable | Confirm the server is running and the port matches `SERVER_PORT` or the CLI argument. |
-| `packages_ok` is false | Reinstall dependencies with `python -m pip install -r requirements.txt`. |
-| JD analysis returns no skills | Try a longer JD, disable LLM to use the rule-based extractor, or manually supply requirements through the API/UI. |
-| PDF or DOCX text is empty | Confirm the document contains selectable text; scanned images may not extract correctly. |
-| LLM features do not run | Confirm `GROQ_API_KEY_1` is set and `/status` reports `llm_enabled: true`. |
-| LLM calls are slow | The backend intentionally delays calls with `LLM_CALL_DELAY_SECONDS` to reduce rate-limit errors. |
-| File opening is denied | The file must be inside the selected root folder and use `.pdf`, `.docx`, or `.txt`. |
-
-## Roadmap And Limitations
-
-- Add broader end-to-end tests for ranking behavior, document parsing, and multi-role JD detection.
-- Add fixture-based regression tests for scoring weights and extracted requirements.
-- Package the UI as a standalone app or document the host workflow integration in more detail.
-- Replace permissive local-development CORS with explicit origins if the API is exposed outside localhost.
-- Add OCR support for scanned resumes.
-- Add export options for ranked results.
-- Add structured logging and request IDs for easier debugging of large ranking runs.
-
-## Recruiter-Facing Quality Signals
-
-- Clear separation between deterministic local ranking and optional LLM review.
-- Explainable scoring dimensions instead of a single black-box match score.
-- Local file safety checks for opening resumes from the UI.
-- CI across two current Python versions.
-- Dependency list is small and focused: FastAPI, Pydantic, scikit-learn, PyMuPDF, python-docx, requests, and pytest/httpx for tests.
-
-ResumeRanker is built to make technical resume review faster, more consistent, and easier to defend in conversation with hiring teams.
+Controls address unauthenticated access, missing-secret bypasses, token timing leakage, hostile Host/Origin headers, path traversal and symlink escapes, oversized inputs, scan amplification, accidental provider disclosure, and remote shutdown. The service does not include tenant isolation, malware scanning, OCR, document sandboxing, anti-bias validation, durable queues, TLS, per-subject audit logs, or a complete hiring governance workflow. Human review is required for every hiring decision.
 
 ## License
 
-All rights reserved. This repository is public for portfolio and recruitment review. Reuse, redistribution, or commercial use requires explicit written permission from Karthik Ramesh.
+All rights reserved. See [LICENSE](LICENSE).

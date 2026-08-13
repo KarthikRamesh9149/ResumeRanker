@@ -2,6 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import resumeranker_server as server
 from resumeranker_server import (
     DEFAULT_CORS_ORIGINS,
     LlmContextualScores,
@@ -59,12 +60,12 @@ def test_contextual_score_defaults_are_independent() -> None:
 
 
 def test_status_endpoint_reports_ready() -> None:
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://localhost")
 
     response = client.get("/status")
 
     assert response.status_code == 200
-    assert response.json()["ready"] is True
+    assert response.json()["ready"] is False
 
 
 def test_cors_origins_default_to_explicit_local_hosts(monkeypatch) -> None:
@@ -80,7 +81,7 @@ def test_cors_origins_are_parsed_from_environment(monkeypatch) -> None:
 
 
 def test_browser_cors_preflight_allows_configured_origin() -> None:
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://localhost")
 
     response = client.options(
         "/status",
@@ -92,3 +93,43 @@ def test_browser_cors_preflight_allows_configured_origin() -> None:
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+
+def test_production_fails_closed_without_token(monkeypatch) -> None:
+    monkeypatch.setattr(server, "DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(server, "API_TOKEN", "")
+    assert TestClient(app, base_url="http://localhost").get("/packages").status_code == 503
+
+
+def test_production_requires_bearer_token(monkeypatch) -> None:
+    token = "r" * 32
+    monkeypatch.setattr(server, "DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(server, "API_TOKEN", token)
+    client = TestClient(app, base_url="http://localhost")
+    assert client.get("/packages").status_code == 401
+    assert client.get("/packages", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+
+def test_demo_mode_requires_loopback(monkeypatch) -> None:
+    monkeypatch.setattr(server, "DEPLOYMENT_MODE", "demo")
+    monkeypatch.setattr(server, "SERVER_HOST", "127.0.0.1")
+    assert TestClient(app, base_url="http://localhost").get("/packages").status_code == 200
+    monkeypatch.setattr(server, "SERVER_HOST", "0.0.0.0")
+    assert TestClient(app, base_url="http://localhost").get("/packages").status_code == 503
+
+
+def test_request_limit_is_enforced(monkeypatch) -> None:
+    monkeypatch.setattr(server, "DEPLOYMENT_MODE", "demo")
+    monkeypatch.setattr(server, "SERVER_HOST", "127.0.0.1")
+    monkeypatch.setattr(server, "MAX_REQUEST_BYTES", 4)
+    assert TestClient(app, base_url="http://localhost").post("/rank", content=b"12345").status_code == 413
+
+
+def test_chunked_request_limit_is_enforced(monkeypatch) -> None:
+    monkeypatch.setattr(server, "DEPLOYMENT_MODE", "demo")
+    monkeypatch.setattr(server, "SERVER_HOST", "127.0.0.1")
+    monkeypatch.setattr(server, "MAX_REQUEST_BYTES", 4)
+    response = TestClient(app, base_url="http://localhost").post(
+        "/rank", content=iter([b"123", b"45"])
+    )
+    assert response.status_code == 413
