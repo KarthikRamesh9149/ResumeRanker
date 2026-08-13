@@ -1,116 +1,131 @@
 # ResumeRanker
 
-ResumeRanker is an explainable, local-first screening service for PDF, DOCX, and TXT resumes. It extracts job requirements, scores evidence by resume section, supports multi-role job descriptions, and can optionally evaluate a bounded shortlist through a Groq-compatible model.
+### Turn a resume folder and a job description into an evidence-led shortlist that a human can actually review.
 
-![ResumeRanker FastAPI documentation showing the standalone backend routes](docs/assets/screenshots/resumeranker-api-docs.png)
+An AI product-builder portfolio project by [Karthik Ramesh](https://github.com/KarthikRamesh9149), designed around transparent matching rather than opaque automated hiring decisions.
 
-_The standalone FastAPI surface running locally; the richer TypeScript screen is intended for its host workflow._
+![ResumeRanker's local FastAPI documentation showing the available review workflow endpoints](docs/assets/screenshots/resumeranker-api-docs.png)
+
+*The standalone API surface running locally. `ResumeRankerWindow.tsx` is a UI component for its host workflow, not a packaged standalone frontend.*
+
+## What it is
+
+ResumeRanker is a local-first resume-screening service for PDF, DOCX, and TXT documents. It reads an approved folder, extracts requirements from a job description, ranks candidate evidence, and returns matched and missing skills, section scores, and concise explanations.
+
+Every candidate starts with deterministic local scoring. A Groq-compatible model can be opted into for a bounded shortlist, but it is not required for the ranking workflow.
+
+## Who it serves—and the problem it solves
+
+ResumeRanker is for recruiters, hiring managers, talent operations teams, and forward-deployed engineers building a tightly scoped internal review workflow.
+
+Keyword-only filtering is hard to defend: it loses the difference between a technology listed in a skills section and the same technology demonstrated in a project or role. ResumeRanker makes that evidence visible, keeps documents on an approved local path by default, and returns a shortlist meant to support—not replace—human judgment.
+
+## Product workflow
+
+1. **Set a review boundary** — configure one approved local workspace containing the candidate documents and, if needed, a job-description file.
+2. **Inspect the candidate set** — scan supported PDF, DOCX, and TXT files under that root.
+3. **Understand the role** — paste a job description or analyse an approved JD file to extract required and preferred skills, experience expectations, certifications, and multiple roles where detected.
+4. **Rank the evidence** — score projects, experience, skills, certifications, and TF-IDF similarity; return the strongest candidates with matched and missing requirements.
+5. **Compare roles** — rank the same resume folder against a bounded list of job descriptions without rereading documents for each role.
+6. **Review, decide, document** — use the ranking and explanations as decision support; a human remains responsible for every hiring decision.
+
+## Key features
+
+| Capability | Value to the reviewer |
+| --- | --- |
+| Approved-root file access | Keeps scanning and text extraction inside one configured workspace; path traversal, symlink, and sibling-prefix escapes are rejected. |
+| PDF, DOCX, and TXT parsing | Lets teams work with common local resume and JD formats without a separate conversion step. |
+| Requirement extraction | Separates required skills, preferred skills, experience, and certifications; can detect multiple roles in one JD. |
+| Evidence-weighted ranking | Scores project, experience, skills, and certification sections separately, so demonstrated work can carry more weight than a keyword list. |
+| Transparent review output | Returns section scores, matched and missing skills, TF-IDF similarity, keyword coverage, and a deterministic explanation for each ranked candidate. |
+| Multi-role evaluation | Reuses resume text to rank one candidate folder against multiple job descriptions, subject to configured limits. |
+| Optional bounded AI review | With explicit local configuration and request opt-in, applies a Groq-compatible model only to a limited shortlist. |
 
 ## Architecture
 
-```text
-Host UI or API client
-        |
-Host/CORS allowlists -> body limit -> bearer authentication
-        |
-        v
-approved filesystem root -> bounded document parsing -> deterministic scoring
-                                                    |
-                                                    +-> opt-in LLM shortlist
-        |
-        v
-ranked candidates, matched/missing skills, section scores, explanations
+```mermaid
+flowchart LR
+    R[Recruiter or host UI] --> A[FastAPI service]
+    J[JD text or approved JD file] --> A
+    F[Approved local resume root] --> G[Bounded scanner and parser]
+    G --> E[Section and requirement extraction]
+    A --> E
+    E --> S[Deterministic evidence scoring]
+    S --> O[Ranked candidates, matched/missing skills, explanations]
+    S -. explicit opt-in; bounded shortlist .-> L[Groq-compatible evaluation]
+    L --> O
 ```
 
-`resumeranker_server.py` contains the FastAPI boundary, parsers, requirement extraction, ranking, and provider integration. `ResumeRankerWindow.tsx` is a host-workflow UI component, not a standalone packaged frontend.
+`resumeranker_server.py` owns the API boundary, document parsers, extraction logic, ranking, and optional provider integration. `ResumeRankerWindow.tsx` is a host-workflow UI component rather than a separately runnable web app.
 
-## Ranking model
+## Tech stack
 
-Every document is scored locally first. TF-IDF similarity is combined with required/preferred skill coverage and separate project, experience, skills, and certification evidence. Demonstrated project use is weighted more strongly than a keyword listed only in a skills section. If the JD does not request certifications or the resume lacks relevant experience, weights are redistributed rather than silently penalising the candidate. Outputs are decision support, not an automated hiring decision.
+| Layer | Implementation |
+| --- | --- |
+| Service API | FastAPI + Uvicorn |
+| Resume/JD parsing | PyMuPDF + python-docx + standard text reading |
+| Matching | scikit-learn TF-IDF and cosine similarity |
+| Scoring support | NumPy + SciPy + Joblib |
+| Configuration | python-dotenv |
+| Optional AI evaluation | Groq-compatible OpenAI-style API via Requests |
+| Host UI component | TypeScript / React (`ResumeRankerWindow.tsx`) |
+| Quality gates | pytest + GitHub Actions |
 
-## Secure deployment modes
+## Quick start
 
-Production is the default. Every endpoint except `GET /status`, including `/docs`, `/packages`, local file operations, and shutdown, requires a bearer token. `RESUMERANKER_API_TOKEN` must be at least 32 characters or protected routes return generic `503` responses. Token checks are constant-time. Browser origins and Host headers are explicit allowlists; wildcards fail readiness. JSON request bodies, scanned files, aggregate folder bytes, scan counts, JD entries, and LLM candidates are bounded.
-
-`RESUMERANKER_MODE=demo` is the only unauthenticated mode. It works only with a loopback listener and fails closed on a network address. Filesystem features remain disabled until an approved root is configured, and provider calls remain disabled until separately opted in.
-
-## Setup
-
-Requires Python 3.12 or 3.13.
+**Prerequisite:** Python 3.12 or 3.13.
 
 ```bash
+git clone https://github.com/KarthikRamesh9149/ResumeRanker.git
+cd ResumeRanker
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt -r requirements-dev.txt
 cp .env.example .env
 ```
 
-Create a dedicated resume workspace and set its canonical path:
+Create a dedicated local review workspace, then make it the only root the service may read:
 
 ```bash
 export RESUMERANKER_APPROVED_ROOT=/absolute/path/to/review-workspace
-```
-
-Explicit local demo:
-
-```bash
 RESUMERANKER_MODE=demo python resumeranker_server.py
 ```
 
-Production-style local run:
+The demo mode is local-only and intentionally unauthenticated. For a protected local service instead:
 
 ```bash
+export RESUMERANKER_APPROVED_ROOT=/absolute/path/to/review-workspace
 export RESUMERANKER_API_TOKEN='replace-with-a-random-32-plus-character-secret'
 python resumeranker_server.py
-curl -H "Authorization: Bearer $RESUMERANKER_API_TOKEN" http://127.0.0.1:8892/packages
+curl http://127.0.0.1:8892/packages \
+  -H "Authorization: Bearer $RESUMERANKER_API_TOKEN"
 ```
 
-## API
+`GET /status` is public for readiness. The authenticated review flow is: `/scan_folder` → `/analyze_jd` → `/rank` or `/rank_multi`; `/extract_text` and `/open_file` support review of approved documents.
 
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/status` | Public liveness/readiness without secret or package details |
-| `GET` | `/packages` | Authenticated dependency inventory |
-| `POST` | `/scan_folder` | List supported files under the approved root |
-| `POST` | `/analyze_jd` | Extract requirements and role sections |
-| `POST` | `/rank` | Rank one resume folder against one JD |
-| `POST` | `/rank_multi` | Rank against a bounded JD list |
-| `POST` | `/extract_text` | Extract text from an approved document |
-| `POST` | `/open_file` | Open an approved local document |
-| `POST` | `/shutdown` | Demo-only, loopback-only, explicitly enabled legacy control |
+## Product and engineering decisions
 
-`top_n` is capped at 20. Paths are canonicalised and must remain inside `RESUMERANKER_APPROVED_ROOT`; symlink and sibling-prefix escapes are rejected.
+- **Evidence before an LLM.** All resumes receive deterministic section-based scoring first. The optional provider only evaluates a bounded top subset when a request and local configuration explicitly allow it.
+- **Demonstrated work matters.** The ranking model distinguishes evidence in projects, experience, skills, and certifications instead of treating a flat keyword list as a complete signal.
+- **No silent penalty for irrelevant signals.** When a JD does not ask for certifications, or relevant experience evidence is absent, the scoring weights are redistributed rather than quietly penalising the candidate.
+- **Local data boundaries are part of the product.** File features remain disabled until `RESUMERANKER_APPROVED_ROOT` is configured, and all paths are resolved inside that canonical root.
+- **Human review is the final control.** Outputs are decision support. The service does not make hiring decisions, validate fairness, or provide a complete hiring-governance workflow.
 
-## Configuration and limits
-
-| Variable | Default | Boundary |
-| --- | --- | --- |
-| `RESUMERANKER_MODE` | `production` | `production` or explicit loopback `demo` |
-| `RESUMERANKER_API_TOKEN` | empty | Required in production; minimum 32 characters |
-| `SERVER_HOST` / `SERVER_PORT` | `127.0.0.1` / `8892` | Network binding also requires explicit exposure opt-in |
-| `TRUSTED_HOSTS` | loopback hosts | Host-header allowlist; wildcard forbidden |
-| `CORS_ORIGINS` | local port 3000 origins | Browser allowlist; wildcard forbidden |
-| `RESUMERANKER_MAX_REQUEST_BYTES` | 1 MiB | JSON/body bound; hard maximum 10 MiB |
-| `RESUMERANKER_MAX_SCAN_FILES` | 100 | Hard maximum 500 |
-| `RESUMERANKER_MAX_FILE_BYTES` | 10 MiB | Hard maximum 50 MiB per document |
-| `RESUMERANKER_MAX_FOLDER_BYTES` | 100 MiB | Hard maximum 500 MiB per scan |
-| `RESUMERANKER_MAX_JD_ENTRIES` | 5 | Hard maximum 20 |
-| `RESUMERANKER_MAX_LLM_CANDIDATES` | 5 | Hard maximum 10 |
-
-Provider use requires all three: a request option such as `use_llm`, `RESUMERANKER_ENABLE_LLM_CALLS=true`, and `GROQ_API_KEY_1`. Candidate content may leave the machine when enabled; confirm consent, retention, and data-processing terms first.
-
-## Testing and operations
+## Testing
 
 ```bash
 python -m py_compile resumeranker_server.py
 python -m pytest -q
 ```
 
-CI runs the suite on Python 3.12 and 3.13. A deployment gate should require `/status` to report `ready: true`. Put network deployments behind TLS, rate limiting, and an identity-aware proxy; provide secrets through the platform secret manager; run with least-privilege read access to a dedicated approved root; stop production using the process supervisor's graceful signal. The shutdown route is intentionally unavailable in production.
+GitHub Actions installs the declared dependencies and runs the test suite on Python 3.12 and 3.13.
 
-## Threat model and limitations
+## Security and limitations
 
-Controls address unauthenticated access, missing-secret bypasses, token timing leakage, hostile Host/Origin headers, path traversal and symlink escapes, oversized inputs, scan amplification, accidental provider disclosure, and remote shutdown. The service does not include tenant isolation, malware scanning, OCR, document sandboxing, anti-bias validation, durable queues, TLS, per-subject audit logs, or a complete hiring governance workflow. Human review is required for every hiring decision.
+- The service binds to loopback unless `RESUMERANKER_ALLOW_NETWORK_EXPOSURE=true` is set. Production mode requires a 32+ character `RESUMERANKER_API_TOKEN`; wildcard Host and CORS values fail configuration validation.
+- The approved root, per-file size, aggregate folder size, scan count, request body, job-description count, and AI shortlist size are bounded. Defaults are documented in [`.env.example`](.env.example) and hard limits are enforced by the service.
+- Resume and JD content stays local unless all three conditions are met: the request opts in, `RESUMERANKER_ENABLE_LLM_CALLS=true`, and `GROQ_API_KEY_1` is configured. Obtain the appropriate consent and review provider terms first.
+- This repository does **not** provide OCR, malware scanning, document sandboxing, tenant isolation, subject-level audit logs, TLS termination, anti-bias validation, durable job queues, or a complete hiring-governance system. Network deployments need TLS, rate limiting, an identity-aware proxy, and least-privilege access to a dedicated document root.
 
 ## License
 
